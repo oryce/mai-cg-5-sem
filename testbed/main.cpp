@@ -14,7 +14,7 @@
 
 namespace {
 
-constexpr float camera_fov = 70.0f;
+float camera_fov = 70.0f;
 constexpr float camera_near_plane = 0.01f;
 constexpr float camera_far_plane = 100.0f;
 
@@ -28,14 +28,13 @@ struct Vector {
 
 struct Vertex {
 	Vector position;
-	// NOTE: You can add more attributes
+	Vector color;
 };
 
 // NOTE: These variable will be available to shaders through push constant uniform
 struct ShaderConstants {
 	Matrix projection;
 	Matrix transform;
-	Vector color;
 };
 
 struct VulkanBuffer {
@@ -56,6 +55,10 @@ Vector model_position = {0.0f, 0.0f, 5.0f};
 float model_rotation;
 Vector model_color = {0.5f, 1.0f, 0.7f };
 bool model_spin = true;
+float rotation_speed = 1.0f;
+uint32_t torus_index_count = 0;
+bool use_perspective = true;
+float ortho_scale = 3.0f;
 
 Matrix identity() {
 	Matrix result{};
@@ -80,6 +83,25 @@ Matrix projection(float fov, float aspect_ratio, float near, float far) {
 
 	result.m[2][2] = far / (far - near);
 	result.m[3][2] = (-near * far) / (far - near);
+
+	return result;
+}
+
+Matrix orthographic(float scale, float aspect_ratio, float near, float far) {
+	Matrix result{};
+
+	float right = scale * aspect_ratio;
+	float left = -right;
+	float top = scale;
+	float bottom = -top;
+
+	result.m[0][0] = 2.0f / (right - left);
+	result.m[1][1] = 2.0f / (top - bottom);
+	result.m[2][2] = 1.0f / (far - near);
+	result.m[3][0] = -(right + left) / (right - left);
+	result.m[3][1] = -(top + bottom) / (top - bottom);
+	result.m[3][2] = -near / (far - near);
+	result.m[3][3] = 1.0f;
 
 	return result;
 }
@@ -258,6 +280,49 @@ void destroyBuffer(const VulkanBuffer& buffer) {
 	vkDestroyBuffer(device, buffer.buffer, nullptr);
 }
 
+void generateTorus(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+                   float major_radius, float minor_radius, int major_segments, int minor_segments) {
+	vertices.clear();
+	indices.clear();
+
+	for (int i = 0; i <= major_segments; ++i) {
+		float u = 2.0f * M_PI * float(i) / float(major_segments);
+		float cos_u = cosf(u);
+		float sin_u = sinf(u);
+
+		for (int j = 0; j <= minor_segments; ++j) {
+			float v = 2.0f * M_PI * float(j) / float(minor_segments);
+			float cos_v = cosf(v);
+			float sin_v = sinf(v);
+
+			float x = (major_radius + minor_radius * cos_v) * cos_u;
+			float y = (major_radius + minor_radius * cos_v) * sin_u;
+			float z = minor_radius * sin_v;
+
+			float color_r = 0.5f + 0.5f * cosf(u);
+			float color_g = 0.5f + 0.5f * sinf(v);
+			float color_b = 0.5f + 0.5f * sinf(u + v);
+
+			vertices.push_back({{x, y, z}, {color_r, color_g, color_b}});
+		}
+	}
+
+	for (int i = 0; i < major_segments; ++i) {
+		for (int j = 0; j < minor_segments; ++j) {
+			int current = i * (minor_segments + 1) + j;
+			int next = current + minor_segments + 1;
+
+			indices.push_back(current);
+			indices.push_back(current + 1);
+			indices.push_back(next);
+
+			indices.push_back(current + 1);
+			indices.push_back(next + 1);
+			indices.push_back(next);
+		}
+	}
+}
+
 void initialize() {
 	VkDevice& device = veekay::app.vk_device;
 	VkPhysicalDevice& physical_device = veekay::app.vk_physical_device;
@@ -305,20 +370,17 @@ void initialize() {
 		// NOTE: Declare vertex attributes
 		VkVertexInputAttributeDescription attributes[] = {
 			{
-				.location = 0, // NOTE: First attribute
+				.location = 0, // NOTE: First attribute (position)
 				.binding = 0, // NOTE: First vertex buffer
 				.format = VK_FORMAT_R32G32B32_SFLOAT, // NOTE: 3-component vector of floats
 				.offset = offsetof(Vertex, position), // NOTE: Offset of "position" field in a Vertex struct
 			},
-			// NOTE: If you want more attributes per vertex, declare them here
-#if 0
 			{
-				.location = 1, // NOTE: Second attribute
+				.location = 1, // NOTE: Second attribute (color)
 				.binding = 0,
-				.format = VK_FORMAT_XXX,
-				.offset = offset(Vertex, your_attribute),
+				.format = VK_FORMAT_R32G32B32_SFLOAT, // NOTE: 3-component vector of floats
+				.offset = offsetof(Vertex, color), // NOTE: Offset of "color" field in a Vertex struct
 			},
-#endif
 		};
 
 		// NOTE: Bring 
@@ -454,28 +516,17 @@ void initialize() {
 		}
 	}
 
-	// TODO: You define model vertices and create buffers here
-	// TODO: Index buffer has to be created here too
-	// NOTE: Look for createBuffer function
+	std::vector<Vertex> vertices;
+	std::vector<uint32_t> indices;
+	
+	generateTorus(vertices, indices, 1.5f, 0.5f, 20, 10);
+	
+	torus_index_count = static_cast<uint32_t>(indices.size());
 
-	// (v0)------(v1)
-	//  |  \       |
-	//  |   `--,   |
-	//  |       \  |
-	// (v3)------(v2)
-	Vertex vertices[] = {
-		{{-1.0f, -1.0f, 0.0f}},
-		{{1.0f, -1.0f, 0.0f}},
-		{{1.0f, 1.0f, 0.0f}},
-		{{-1.0f, 1.0f, 0.0f}},
-	};
-
-	uint32_t indices[] = { 0, 1, 2, 2, 3, 0 };
-
-	vertex_buffer = createBuffer(sizeof(vertices), vertices,
+	vertex_buffer = createBuffer(vertices.size() * sizeof(Vertex), vertices.data(),
 	                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
 
-	index_buffer = createBuffer(sizeof(indices), indices,
+	index_buffer = createBuffer(indices.size() * sizeof(uint32_t), indices.data(),
 	                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 }
 
@@ -497,15 +548,27 @@ void update(double time) {
 	ImGui::InputFloat3("Translation", reinterpret_cast<float*>(&model_position));
 	ImGui::SliderFloat("Rotation", &model_rotation, 0.0f, 2.0f * M_PI);
 	ImGui::Checkbox("Spin?", &model_spin);
-	// TODO: Your GUI stuff here
+	ImGui::SliderFloat("Rotation Speed", &rotation_speed, 0.1f, 5.0f);
+	ImGui::Separator();
+	ImGui::Text("Projection Settings:");
+	ImGui::Checkbox("Perspective Projection", &use_perspective);
+	if (use_perspective) {
+		ImGui::SliderFloat("Field of View", &camera_fov, 30.0f, 120.0f);
+	} else {
+		ImGui::SliderFloat("Orthographic Scale", &ortho_scale, 1.0f, 10.0f);
+	}
 	ImGui::End();
 
 	// NOTE: Animation code and other runtime variable updates go here
 	if (model_spin) {
-		model_rotation = float(time);
+		model_rotation = float(time * rotation_speed);
 	}
 
 	model_rotation = fmodf(model_rotation, 2.0f * M_PI);
+	
+	model_color.x = 0.5f + 0.5f * sinf(float(time) * 0.7f);
+	model_color.y = 0.5f + 0.5f * sinf(float(time) * 0.5f + M_PI / 3.0f);
+	model_color.z = 0.5f + 0.5f * sinf(float(time) * 0.3f + 2.0f * M_PI / 3.0f);
 }
 
 void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
@@ -558,16 +621,17 @@ void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
 		vkCmdBindIndexBuffer(cmd, index_buffer.buffer, offset, VK_INDEX_TYPE_UINT32);
 
 		// NOTE: Variables like model_XXX were declared globally
+		float aspect_ratio = float(veekay::app.window_width) / float(veekay::app.window_height);
+		
+		Matrix projection_matrix = use_perspective
+			? projection(camera_fov, aspect_ratio, camera_near_plane, camera_far_plane)
+			: orthographic(ortho_scale, aspect_ratio, camera_near_plane, camera_far_plane);
+		
 		ShaderConstants constants{
-			.projection = projection(
-				camera_fov,
-				float(veekay::app.window_width) / float(veekay::app.window_height),
-				camera_near_plane, camera_far_plane),
+			.projection = projection_matrix,
 
-			.transform = multiply(rotation({0.0f, 1.0f, 0.0f}, model_rotation),
+			.transform = multiply(rotation({1.0f, 1.0f, 0.0f}, model_rotation),
 			                      translation(model_position)),
-
-			.color = model_color,
 		};
 
 		// NOTE: Update constant memory with new shader constants
@@ -575,8 +639,7 @@ void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
 		                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		                   0, sizeof(ShaderConstants), &constants);
 
-		// NOTE: Draw 6 indices (3 vertices * 2 triangles), 1 group, no offsets
-		vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+		vkCmdDrawIndexed(cmd, torus_index_count, 1, 0, 0, 0);
 	}
 
 	vkCmdEndRenderPass(cmd);
