@@ -10,11 +10,15 @@ layout (location = 2) out vec2 f_uv;
 
 layout (binding = 0, std140) uniform SceneUniforms {
 	mat4 view_projection;
+	vec4 camera_position;
+	uvec4 lights_count;
 };
 
 layout (binding = 1, std140) uniform ModelUniforms {
 	mat4 model;
-	vec3 albedo_color;
+	vec3 albedo_color; float _pad0;
+	vec3 specular_color; float _pad1;
+	float shininess;
 };
 
 void main() {
