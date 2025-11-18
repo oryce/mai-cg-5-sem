@@ -15,6 +15,7 @@
 namespace {
 
 constexpr uint32_t max_models = 1024;
+constexpr uint32_t max_lights = 8;
 
 struct Vertex {
 	veekay::vec3 position;
@@ -25,11 +26,21 @@ struct Vertex {
 
 struct SceneUniforms {
 	veekay::mat4 view_projection;
+	// NOTE: Camera position is actually a `vec3` wrapped in a `vec4`
+	//       to avoid padding issues.
+	veekay::vec4 camera_position;
+
+	uint32_t diffuse_light_count;
+	uint32_t directional_light_count;
+	uint32_t point_light_count;
+	uint32_t spotlight_count;
 };
 
 struct ModelUniforms {
 	veekay::mat4 model;
 	veekay::vec3 albedo_color; float _pad0;
+	veekay::vec3 specular_color; float _pad1;
+	float shininess;
 };
 
 struct Mesh {
@@ -51,6 +62,31 @@ struct Model {
 	Mesh mesh;
 	Transform transform;
 	veekay::vec3 albedo_color;
+	veekay::vec3 specular_color;
+	float shininess;
+};
+
+struct DiffuseLight {
+	veekay::vec3 position; float _pad0;
+	veekay::vec3 color; float _pad1;
+};
+
+struct DirectionalLight {
+	veekay::vec3 direction; float _pad0;
+	veekay::vec3 color; float _pad1;
+};
+
+struct PointLight {
+	veekay::vec3 position; float _pad0;
+	veekay::vec3 color; float _pad1;
+};
+
+struct Spotlight {
+	veekay::vec3 position; float _pad0;
+	veekay::vec3 direction; float _pad1;
+	veekay::vec3 color;
+	float cutoff;
+	float outer_cutoff;
 };
 
 struct Camera {
@@ -58,27 +94,82 @@ struct Camera {
 	constexpr static float default_near_plane = 0.01f;
 	constexpr static float default_far_plane = 100.0f;
 
-	veekay::vec3 position = {};
-	veekay::vec3 rotation = {};
+	veekay::vec3 position;
+	veekay::vec2 rotation;
 
 	float fov = default_fov;
 	float near_plane = default_near_plane;
 	float far_plane = default_far_plane;
 
+	Camera() = default;
+
+	Camera(veekay::vec3 position_, veekay::vec2 rotation_)
+		: position(position_), rotation(rotation_) {}
+
 	// NOTE: View matrix of camera (inverse of a transform)
-	veekay::mat4 view() const;
+	virtual veekay::mat4 view() const = 0;
 
 	// NOTE: View and projection composition
 	veekay::mat4 view_projection(float aspect_ratio) const;
 };
 
+float toRadians(float degrees) {
+	return degrees * float(M_PI) / 180.0f;
+}
+
+struct LookAtCamera : Camera {
+	LookAtCamera(veekay::vec3 position_, veekay::vec2 rotation_)
+		: Camera(position_, rotation_) {}
+
+	veekay::mat4 view() const override {
+		static const veekay::vec3 up = {0.0f, 1.0f, 0.0f};
+			
+		veekay::vec3 front = {
+			cosf(toRadians(rotation.x)) * cosf(toRadians(rotation.y)),
+			sinf(toRadians(rotation.y)),
+			sinf(toRadians(rotation.x)) * cosf(toRadians(rotation.y))
+		};
+
+		front = veekay::vec3::normalized(front);
+
+		return veekay::mat4::look_at(position, position + front, up);
+	}
+};
+
+struct TransformationCamera : Camera {
+	TransformationCamera(veekay::vec3 position_, veekay::vec2 rotation_)
+		: Camera(position_, rotation_) {}
+
+	veekay::mat4 view() const override {
+		const auto r_yaw = veekay::mat4::rotation(
+			veekay::vec3{0.0f, 1.0f, 0.0f}, toRadians(rotation.x));
+		const auto r_pitch = veekay::mat4::rotation(
+			veekay::vec3{1.0f, 0.0f, 0.0f}, toRadians(rotation.y));
+
+		return veekay::mat4::transpose(r_yaw * r_pitch) 
+			* veekay::mat4::translation(-position);
+	}
+};
+
 // NOTE: Scene objects
 inline namespace {
-	Camera camera{
-		.position = {0.0f, -0.5f, -3.0f}
+	LookAtCamera look_at_camera{
+		/* position */ {0.0f, -0.5f, -3.0f},
+		/* rotation */ {0.0f, 0.0f}
 	};
 
+	TransformationCamera transformation_camera{
+		/* position */ {0.0f, -0.5f, -3.0f},
+		/* rotation */ {0.0f, 0.0f}
+	};
+
+	Camera *camera = &look_at_camera;
+
 	std::vector<Model> models;
+	std::vector<DiffuseLight> diffuse_lights;
+	std::vector<DirectionalLight> directional_lights;
+	std::vector<PointLight> point_lights;
+	std::vector<Spotlight> spotlights;
 }
 
 // NOTE: Vulkan objects
@@ -95,6 +186,10 @@ inline namespace {
 
 	veekay::graphics::Buffer* scene_uniforms_buffer;
 	veekay::graphics::Buffer* model_uniforms_buffer;
+	veekay::graphics::Buffer* diffuse_lights_buffer;
+	veekay::graphics::Buffer* directional_lights_buffer;
+	veekay::graphics::Buffer* point_lights_buffer;
+	veekay::graphics::Buffer* spotlights_buffer;
 
 	Mesh plane_mesh;
 	Mesh cube_mesh;
@@ -106,22 +201,10 @@ inline namespace {
 	VkSampler texture_sampler;
 }
 
-float toRadians(float degrees) {
-	return degrees * float(M_PI) / 180.0f;
-}
-
 veekay::mat4 Transform::matrix() const {
 	// TODO: Scaling and rotation
 
 	auto t = veekay::mat4::translation(position);
-
-	return t;
-}
-
-veekay::mat4 Camera::view() const {
-	// TODO: Rotation
-
-	auto t = veekay::mat4::translation(-position);
 
 	return t;
 }
@@ -321,6 +404,10 @@ void initialize(VkCommandBuffer cmd) {
 					.descriptorCount = 8,
 				},
 				{
+					.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+					.descriptorCount = 8,
+				},
+				{
 					.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 					.descriptorCount = 8,
 				}
@@ -355,6 +442,30 @@ void initialize(VkCommandBuffer cmd) {
 					.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 					.descriptorCount = 1,
 					.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+				{
+					.binding = 2,
+					.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+				{
+					.binding = 3,
+					.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+				{
+					.binding = 4,
+					.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+				{
+					.binding = 5,
+					.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 				},
 			};
 
@@ -436,6 +547,26 @@ void initialize(VkCommandBuffer cmd) {
 		nullptr,
 		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
+	diffuse_lights_buffer = new veekay::graphics::Buffer(
+		max_lights * sizeof(DiffuseLight),
+		nullptr,
+		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+	directional_lights_buffer = new veekay::graphics::Buffer(
+		max_lights * sizeof(DirectionalLight),
+		nullptr,
+		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+		
+	point_lights_buffer = new veekay::graphics::Buffer(
+		max_lights * sizeof(PointLight),
+		nullptr,
+		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+	spotlights_buffer = new veekay::graphics::Buffer(
+		max_lights * sizeof(PointLight),
+		nullptr,
+		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
 	// NOTE: This texture and sampler is used when texture could not be loaded
 	{
 		VkSamplerCreateInfo info{
@@ -471,6 +602,26 @@ void initialize(VkCommandBuffer cmd) {
 				.offset = 0,
 				.range = sizeof(ModelUniforms),
 			},
+			{
+				.buffer = diffuse_lights_buffer->buffer,
+				.offset = 0,
+				.range = max_lights * sizeof(DiffuseLight),
+			},
+			{
+				.buffer = directional_lights_buffer->buffer,
+				.offset = 0,
+				.range = max_lights * sizeof(DirectionalLight),
+			},
+			{
+				.buffer = point_lights_buffer->buffer,
+				.offset = 0,
+				.range = max_lights * sizeof(PointLight),
+			},
+			{
+				.buffer = spotlights_buffer->buffer,
+				.offset = 0,
+				.range = max_lights * sizeof(PointLight),
+			}
 		};
 
 		VkWriteDescriptorSet write_infos[] = {
@@ -491,6 +642,42 @@ void initialize(VkCommandBuffer cmd) {
 				.descriptorCount = 1,
 				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 				.pBufferInfo = &buffer_infos[1],
+			},
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = descriptor_set,
+				.dstBinding = 2,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+				.pBufferInfo = &buffer_infos[2],
+			},
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = descriptor_set,
+				.dstBinding = 3,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+				.pBufferInfo = &buffer_infos[3],
+			},
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = descriptor_set,
+				.dstBinding = 4,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+				.pBufferInfo = &buffer_infos[4],
+			},
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = descriptor_set,
+				.dstBinding = 5,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+				.pBufferInfo = &buffer_infos[5],
 			},
 		};
 
@@ -585,7 +772,9 @@ void initialize(VkCommandBuffer cmd) {
 	models.emplace_back(Model{
 		.mesh = plane_mesh,
 		.transform = Transform{},
-		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f}
+		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f},
+		.specular_color = veekay::vec3{1.0f, 1.0f, 1.0f},
+		.shininess = 8.0f,
 	});
 
 	models.emplace_back(Model{
@@ -593,7 +782,9 @@ void initialize(VkCommandBuffer cmd) {
 		.transform = Transform{
 			.position = {-2.0f, -0.5f, -1.5f},
 		},
-		.albedo_color = veekay::vec3{1.0f, 0.0f, 0.0f}
+		.albedo_color = veekay::vec3{1.0f, 0.0f, 0.0f},
+		.specular_color = veekay::vec3{0.5f, 0.0f, 0.0f},
+		.shininess = 32.0f
 	});
 
 	models.emplace_back(Model{
@@ -601,7 +792,9 @@ void initialize(VkCommandBuffer cmd) {
 		.transform = Transform{
 			.position = {1.5f, -0.5f, -0.5f},
 		},
-		.albedo_color = veekay::vec3{0.0f, 1.0f, 0.0f}
+		.albedo_color = veekay::vec3{0.0f, 1.0f, 0.0f},
+		.specular_color = veekay::vec3{0.0f, 0.5f, 0.0f},
+		.shininess = 32.0f
 	});
 
 	models.emplace_back(Model{
@@ -609,7 +802,14 @@ void initialize(VkCommandBuffer cmd) {
 		.transform = Transform{
 			.position = {0.0f, -0.5f, 1.0f},
 		},
-		.albedo_color = veekay::vec3{0.0f, 0.0f, 1.0f}
+		.albedo_color = veekay::vec3{0.0f, 0.0f, 1.0f},
+		.specular_color = veekay::vec3{0.0f, 0.0f, 0.5f},
+		.shininess = 32.0f
+	});
+
+	diffuse_lights.emplace_back(DiffuseLight {
+		.position = {0.0f, -0.5f, 0.0f},
+		.color = {1.0f, 1.0f, 1.0f}
 	});
 }
 
@@ -628,6 +828,9 @@ void shutdown() {
 
 	delete model_uniforms_buffer;
 	delete scene_uniforms_buffer;
+	delete diffuse_lights_buffer;
+	delete directional_lights_buffer;
+	delete point_lights_buffer;
 
 	vkDestroyDescriptorSetLayout(device, descriptor_set_layout, nullptr);
 	vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
@@ -640,6 +843,146 @@ void shutdown() {
 
 void update(double time) {
 	ImGui::Begin("Controls:");
+	int control_id = 0;
+
+	{
+		const char *label = nullptr;
+
+		if (camera == &look_at_camera)
+			label = "Look At";
+		else if (camera == &transformation_camera)
+			label = "Transformation";
+
+		if (ImGui::BeginCombo("Camera Type", label)) {
+			if (ImGui::Selectable("Look At", camera == &look_at_camera))
+				camera = &look_at_camera;
+			if (ImGui::Selectable("Transformation", camera == &transformation_camera))
+				camera = &transformation_camera;
+			ImGui::EndCombo();
+		}
+	}
+
+	if (ImGui::CollapsingHeader("Diffuse Lighting", ImGuiTreeNodeFlags_DefaultOpen)) {
+		for (auto it = diffuse_lights.begin(); it != diffuse_lights.end(); ) {
+			auto& light = *it;
+
+			ImGui::PushID(control_id);
+			ImGui::Text("Light %d", control_id);
+			ImGui::DragFloat3("Position", light.position.elements, 0.25f, -5.0f, 5.0f);
+			ImGui::ColorEdit3("Color", light.color.elements);
+
+			if (ImGui::Button("Remove")) {
+				it = diffuse_lights.erase(it);
+			} else {
+				it++;
+			}
+
+			ImGui::Separator();
+			ImGui::PopID();
+
+			control_id++;
+		}
+
+		if (ImGui::Button("Add Diffuse Light") && diffuse_lights.size() < max_lights) {
+			diffuse_lights.push_back(DiffuseLight{
+				.position = {0.0f, -1.0f, 0.0f},
+                .color = {1.0f, 1.0f, 1.0f},
+			});
+		}
+	}
+
+	if (ImGui::CollapsingHeader("Directional Lighting", ImGuiTreeNodeFlags_DefaultOpen)) {
+		for (auto it = directional_lights.begin(); it != directional_lights.end(); ) {
+			auto& light = *it;
+
+			ImGui::PushID(control_id);
+			ImGui::Text("Light %d", control_id);
+			ImGui::DragFloat3("Direction", light.direction.elements, 0.25f, -5.0f, 5.0f);
+			ImGui::ColorEdit3("Color", light.color.elements);
+
+			if (ImGui::Button("Remove")) {
+				it = directional_lights.erase(it);
+			} else {
+				it++;
+			}
+
+			ImGui::Separator();
+			ImGui::PopID();
+
+			control_id++;
+		}
+
+		if (ImGui::Button("Add Directional Light") && directional_lights.size() < max_lights) {
+			directional_lights.push_back(DirectionalLight{
+				.direction = {0.0f, 1.0f, 3.5f},
+                .color = {1.0f, 1.0f, 1.0f},
+			});
+		}
+	}
+
+	if (ImGui::CollapsingHeader("Point Lighting", ImGuiTreeNodeFlags_DefaultOpen)) {
+		for (auto it = point_lights.begin(); it != point_lights.end(); ) {
+			auto& light = *it;
+
+			ImGui::PushID(control_id);
+			ImGui::Text("Light %d", control_id);
+			ImGui::DragFloat3("Position", light.position.elements, 0.25f, -5.0f, 5.0f);
+			ImGui::ColorEdit3("Color", light.color.elements);
+
+			if (ImGui::Button("Remove")) {
+				it = point_lights.erase(it);
+			} else {
+				it++;
+			}
+
+			ImGui::Separator();
+			ImGui::PopID();
+
+			control_id++;
+		}
+
+		if (ImGui::Button("Add Point Light") && point_lights.size() < max_lights) {
+			point_lights.push_back(PointLight{
+				.position = {0.0f, -1.0f, 0.0f},
+                .color = {1.0f, 1.0f, 1.0f},
+			});
+		}
+	}
+
+	if (ImGui::CollapsingHeader("Spotlight", ImGuiTreeNodeFlags_DefaultOpen)) {
+		for (auto it = spotlights.begin(); it != spotlights.end(); ) {
+			auto& light = *it;
+
+			ImGui::PushID(control_id);
+			ImGui::Text("Light %d", control_id);
+			ImGui::DragFloat3("Position", light.position.elements, 0.25f, -5.0f, 5.0f);
+			ImGui::DragFloat3("Direction", light.direction.elements, 0.25f, -5.0f, 5.0f);
+			ImGui::ColorEdit3("Color", light.color.elements);
+			ImGui::DragFloatRange2("Radius", &light.cutoff, &light.outer_cutoff, 1.0f, 0.0f, 180.0f);
+
+			if (ImGui::Button("Remove")) {
+				it = spotlights.erase(it);
+			} else {
+				it++;
+			}
+
+			ImGui::Separator();
+			ImGui::PopID();
+
+			control_id++;
+		}
+
+		if (ImGui::Button("Add Spotlight") && spotlights.size() < max_lights) {
+			spotlights.push_back(Spotlight{
+				.position = {0.0f, -1.0f, 0.0f},
+                .direction = {0.0f, 1.0f, 0.0f},
+				.color = {1.0f, 1.0f, 1.0f},
+				.cutoff = 12.5f,
+				.outer_cutoff = 17.5f
+			});
+		}
+	}
+
 	ImGui::End();
 
 	if (!ImGui::IsWindowHovered()) {
@@ -649,37 +992,45 @@ void update(double time) {
 			auto move_delta = mouse::cursorDelta();
 
 			// TODO: Use mouse_delta to update camera rotation
-			
-			auto view = camera.view();
+			camera->rotation.x -= move_delta.x;
+			camera->rotation.y = std::clamp(camera->rotation.y - move_delta.y, -89.0f, 89.0f);
+
+			auto view = camera->view();
 
 			// TODO: Calculate right, up and front from view matrix
-			veekay::vec3 right = {1.0f, 0.0f, 0.0f};
-			veekay::vec3 up = {0.0f, -1.0f, 0.0f};
-			veekay::vec3 front = {0.0f, 0.0f, 1.0f};
+			veekay::vec3 front = {view[0][2], view[1][2], view[2][2]};
+			veekay::vec3 right = {view[0][0], view[1][0], view[2][0]};
+			veekay::vec3 up = {-view[0][1], -view[1][1], -view[2][1]};
 
 			if (keyboard::isKeyDown(keyboard::Key::w))
-				camera.position += front * 0.1f;
+				camera->position += front * 0.1f;
 
 			if (keyboard::isKeyDown(keyboard::Key::s))
-				camera.position -= front * 0.1f;
+				camera->position -= front * 0.1f;
 
 			if (keyboard::isKeyDown(keyboard::Key::d))
-				camera.position += right * 0.1f;
+				camera->position += right * 0.1f;
 
 			if (keyboard::isKeyDown(keyboard::Key::a))
-				camera.position -= right * 0.1f;
+				camera->position -= right * 0.1f;
 
 			if (keyboard::isKeyDown(keyboard::Key::q))
-				camera.position += up * 0.1f;
+				camera->position += up * 0.1f;
 
 			if (keyboard::isKeyDown(keyboard::Key::z))
-				camera.position -= up * 0.1f;
+				camera->position -= up * 0.1f;
 		}
 	}
 
 	float aspect_ratio = float(veekay::app.window_width) / float(veekay::app.window_height);
 	SceneUniforms scene_uniforms{
-		.view_projection = camera.view_projection(aspect_ratio),
+		.view_projection = camera->view_projection(aspect_ratio),
+		.camera_position = veekay::vec4{camera->position.x, camera->position.y,
+										camera->position.z, 0.0f},
+		.diffuse_light_count = static_cast<uint32_t>(diffuse_lights.size()),
+		.directional_light_count = static_cast<uint32_t>(directional_lights.size()),
+		.point_light_count = static_cast<uint32_t>(point_lights.size()),
+		.spotlight_count = static_cast<uint32_t>(spotlights.size())
 	};
 
 	std::vector<ModelUniforms> model_uniforms(models.size());
@@ -689,9 +1040,27 @@ void update(double time) {
 
 		uniforms.model = model.transform.matrix();
 		uniforms.albedo_color = model.albedo_color;
+		uniforms.specular_color = model.specular_color;
+		uniforms.shininess = model.shininess;
 	}
 
 	*(SceneUniforms*)scene_uniforms_buffer->mapped_region = scene_uniforms;
+	
+	std::memcpy(diffuse_lights_buffer->mapped_region, 
+				diffuse_lights.data(), 
+				diffuse_lights.size() * sizeof(DiffuseLight));
+
+	std::memcpy(directional_lights_buffer->mapped_region, 
+				directional_lights.data(), 
+				directional_lights.size() * sizeof(DirectionalLight));
+
+	std::memcpy(point_lights_buffer->mapped_region, 
+				point_lights.data(), 
+				point_lights.size() * sizeof(PointLight));
+
+	std::memcpy(spotlights_buffer->mapped_region, 
+				spotlights.data(), 
+				spotlights.size() * sizeof(Spotlight));
 
 	const size_t alignment =
 		veekay::graphics::Buffer::structureAlignment(sizeof(ModelUniforms));
