@@ -384,6 +384,33 @@ union mat4 {
 		return result;
 	}
 
+	static mat4 look_at(const vec3& eye, const vec3& center, const vec3& up) {
+		mat4 result{};
+
+		const vec3 f = vec3::normalized(center - eye);
+		const vec3 u = vec3::normalized(vec3::cross(f, up));
+		const vec3 v = vec3::cross(u, f);
+
+		result[0][0] = u.x;
+		result[0][1] = v.x;
+		result[0][2] = -f.x;
+
+		result[1][0] = u.y;
+		result[1][1] = v.y;
+		result[1][2] = -f.y;
+
+		result[2][0] = u.z;
+		result[2][1] = v.z;
+		result[2][2] = -f.z;
+
+		result[3][0] = -vec3::dot(eye, u);
+		result[3][1] = -vec3::dot(eye, v);
+		result[3][2] = vec3::dot(eye, f);
+		result[3][3] = 1;
+
+		return result;
+	}
+
 	static mat4 projection(float fov, float aspect_ratio, float near, float far) {
 		mat4 result{};
 
