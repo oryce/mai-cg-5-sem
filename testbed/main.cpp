@@ -141,13 +141,13 @@ struct TransformationCamera : Camera {
 		: Camera(position_, rotation_) {}
 
 	veekay::mat4 view() const override {
-		const auto r_yaw = veekay::mat4::rotation(
+		// NOTE: I don't know why we have to invert the pitch rotation.
+		const auto rx = veekay::mat4::rotation(
+			veekay::vec3{1.0f, 0.0f, 0.0f}, -toRadians(rotation.y));
+		const auto ry = veekay::mat4::rotation(
 			veekay::vec3{0.0f, 1.0f, 0.0f}, toRadians(rotation.x));
-		const auto r_pitch = veekay::mat4::rotation(
-			veekay::vec3{1.0f, 0.0f, 0.0f}, toRadians(rotation.y));
 
-		return veekay::mat4::transpose(r_yaw * r_pitch) 
-			* veekay::mat4::translation(-position);
+		return veekay::mat4::translation(-position) * ry * rx;
 	}
 };
 
