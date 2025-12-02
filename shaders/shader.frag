@@ -10,12 +10,11 @@ layout (binding = 0, std140) uniform SceneUniforms {
 	mat4 view_projection;
 	vec4 camera_position; // Actually a `vec3` to avoid padding issues.
 	uvec4 lights_count;   // Contains counts for each light type.
+	float time;
 };
 
 layout (binding = 1, std140) uniform ModelUniforms {
 	mat4 model;
-	vec3 albedo_color; float _pad0;
-	vec3 specular_color; float _pad1;
 	float shininess;
 };
 
@@ -58,16 +57,22 @@ layout (binding = 5, std140) readonly buffer SpotlightsBuffer {
 	Spotlight spotlights[];
 };
 
-vec3 diffuse_light(vec3 light_position, vec3 light_color) {
+layout (binding = 6) uniform sampler2D diffuse_sampler;
+
+layout (binding = 7) uniform sampler2D specular_sampler;
+
+layout (binding = 8) uniform sampler2D emissive_sampler;
+
+vec3 diffuse_light(vec3 diffuse_color, vec3 specular_color, vec3 light_position, vec3 light_color) {
 	// Ambient lighting
 	const float ambient_strength = 0.1;
-	vec3 ambient_light = light_color * (ambient_strength * albedo_color);
+	vec3 ambient_light = light_color * (ambient_strength * diffuse_color);
 
 	// Diffuse lighting
 	vec3 normal = normalize(f_normal);
 	vec3 light_dir = normalize(light_position - f_position);
 	float diff = max(dot(normal, light_dir), 0.0);
-	vec3 diffuse_light = light_color * (diff * albedo_color);
+	vec3 diffuse_light = light_color * (diff * diffuse_color);
 
 	// Specular lighting
 	vec3 view_dir = normalize(camera_position.xyz - f_position);
@@ -78,16 +83,16 @@ vec3 diffuse_light(vec3 light_position, vec3 light_color) {
 	return ambient_light + diffuse_light + specular_light;
 }
 
-vec3 directional_light(vec3 light_direction, vec3 light_color) {
+vec3 directional_light(vec3 diffuse_color, vec3 specular_color, vec3 light_direction, vec3 light_color) {
 	// Ambient lighting
 	const float ambient_strength = 0.1;
-	vec3 ambient_light = light_color * (ambient_strength * albedo_color);
+	vec3 ambient_light = light_color * (ambient_strength * diffuse_color);
 
 	// Diffuse lighting
 	vec3 normal = normalize(f_normal);
 	vec3 light_dir = normalize(-light_direction);
 	float diff = max(dot(normal, light_dir), 0.0);
-	vec3 diffuse_light = light_color * (diff * albedo_color);
+	vec3 diffuse_light = light_color * (diff * diffuse_color);
 
 	// Specular lighting
 	vec3 view_dir = normalize(camera_position.xyz - f_position);
@@ -98,8 +103,8 @@ vec3 directional_light(vec3 light_direction, vec3 light_color) {
 	return ambient_light + diffuse_light + specular_light;
 }
 
-vec3 point_light(vec3 light_position, vec3 light_color) {
-	vec3 result = diffuse_light(light_position, light_color);
+vec3 point_light(vec3 diffuse_color, vec3 specular_color, vec3 light_position, vec3 light_color) {
+	vec3 result = diffuse_light(diffuse_color, specular_color, light_position, light_color);
 	float distance = length(light_position - f_position);
 	float attenuation = 1.0 / (distance * distance + 0.1);
 
@@ -107,6 +112,8 @@ vec3 point_light(vec3 light_position, vec3 light_color) {
 }
 
 vec3 spotlight(
+	vec3 diffuse_color,
+	vec3 specular_color,
 	vec3 light_position, 
 	vec3 light_direction, 
 	vec3 light_color,
@@ -115,13 +122,13 @@ vec3 spotlight(
 ) {
 	// Ambient lighting
 	const float ambient_strength = 0.1;
-	vec3 ambient_light = light_color * (ambient_strength * albedo_color);
+	vec3 ambient_light = light_color * (ambient_strength * diffuse_color);
 
 	// Diffuse lighting
 	vec3 normal = normalize(f_normal);
 	vec3 light_dir = normalize(light_position - f_position);
 	float diff = max(dot(normal, light_dir), 0.0);
-	vec3 diffuse_light = light_color * (diff * albedo_color);
+	vec3 diffuse_light = light_color * (diff * diffuse_color);
 
 	// Specular lighting
 	vec3 view_dir = normalize(camera_position.xyz - f_position);
@@ -147,28 +154,41 @@ vec3 spotlight(
 }
 
 void main() {
+	vec2 uv = f_uv;
+    
+	// Funny melting
+    const float melt_amount = 0.3;
+    const float melt_speed = 2.0;
+    uv.x += sin(time * melt_speed + f_uv.y * 10.0) * melt_amount * f_uv.y;
+
+	vec3 diffuse_color = texture(diffuse_sampler, uv).rgb;
+	vec3 specular_color = texture(specular_sampler, uv).rgb;
+
 	vec3 result = vec3(0.0, 0.0, 0.0);
 
 	for (int i = 0; i < lights_count.x; i++) {
 		DiffuseLight light = diffuse_lights[i];
-		result += diffuse_light(light.position, light.color);
+		result += diffuse_light(diffuse_color, specular_color, light.position, light.color);
 	}
 
 	for (int i = 0; i < lights_count.y; i++) {
 		DirectionalLight light = directional_lights[i];
-		result += directional_light(light.direction, light.color);
+		result += directional_light(diffuse_color, specular_color, light.direction, light.color);
 	}
 
 	for (int i = 0; i < lights_count.z; i++) {
 		PointLight light = point_lights[i];
-		result += point_light(light.position, light.color);
+		result += point_light(diffuse_color, specular_color, light.position, light.color);
 	}
 
 	for (int i = 0; i < lights_count.w; i++) {
 		Spotlight light = spotlights[i];
-		result += spotlight(light.position, light.direction, light.color, 
+		result += spotlight(diffuse_color, specular_color, light.position, light.direction, light.color, 
 							cos(radians(light.cutoff)), cos(radians(light.outer_cutoff)));
 	}
 
 	final_color = vec4(result, 1.0f);
+
+	vec4 emissive_color = texture(emissive_sampler, uv);
+	final_color += emissive_color;
 }
