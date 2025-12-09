@@ -154,15 +154,8 @@ vec3 spotlight(
 }
 
 void main() {
-	vec2 uv = f_uv;
-    
-	// Funny melting
-    const float melt_amount = 0.3;
-    const float melt_speed = 2.0;
-    uv.x += sin(time * melt_speed + f_uv.y * 10.0) * melt_amount * f_uv.y;
-
-	vec3 diffuse_color = texture(diffuse_sampler, uv).rgb;
-	vec3 specular_color = texture(specular_sampler, uv).rgb;
+	vec3 diffuse_color = texture(diffuse_sampler, f_uv).rgb;
+	vec3 specular_color = texture(specular_sampler, f_uv).rgb;
 
 	vec3 result = vec3(0.0, 0.0, 0.0);
 
@@ -189,6 +182,6 @@ void main() {
 
 	final_color = vec4(result, 1.0f);
 
-	vec4 emissive_color = texture(emissive_sampler, uv);
+	vec4 emissive_color = texture(emissive_sampler, f_uv);
 	final_color += emissive_color;
 }
